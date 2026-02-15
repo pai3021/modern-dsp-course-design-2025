@@ -39,6 +39,3 @@ for i, filename in enumerate(config.TRAIN_FILES, 1):
 total_elapsed = time.time() - total_start
 print("\n" + "="*70)
 print(f"✅ 所有特征已缓存，总用时: {total_elapsed/60:.1f} 分钟")
-print("="*70)
-print("\n现在可以快速训练了！运行:")
-print("  python train.py --full")

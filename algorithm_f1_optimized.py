@@ -1,221 +1,308 @@
 """
-F1优化版规则分类器 - 专门针对F1分数优化
-核心思路：平衡Precision和Recall，减少误报同时保持高召回率
+F1优化 + 抗跨记录幅值漂移 + 记录级自适应（不改features，只改算法）
+
+特征顺序（与 features.py 一致）：
+[0] rr_pre, [1] rr_post, [2] wt_low, [3] wt_mid, [4] wt_high,
+[5] peak_peak, [6] skew, [7] kurt, [8] entropy
 """
+
 import numpy as np
 
+
 class F1OptimizedClassifier:
-    """
-    F1优化分类器
-    - 使用更严格的多重条件判断
-    - 引入置信度评分机制
-    - 针对训练数据的异常特征分布调优
-    """
     def __init__(self):
+        self._mean = None
+        self._std = None
+        self._q_low = None   # 正常 5% 分位
+        self._q_high = None  # 正常 95% 分位
         self.thresholds = {}
-        self.stat_params = {}
-        self.abnormal_patterns = {}
-        
-    def fit(self, X_train, y_train):
-        """训练：学习正常和异常的特征分布"""
-        # 分离正常和异常样本
-        n_indices = [i for i, label in enumerate(y_train) if label == 'N']
-        x_indices = [i for i, label in enumerate(y_train) if label == 'X']
-        
-        X_normal = X_train[n_indices]
-        X_abnormal = X_train[x_indices] if len(x_indices) > 0 else None
-        
-        print(f"[F1优化训练] 正常:{len(X_normal)}, 异常:{len(x_indices)}")
-        
-        # === 1. RR间期阈值（核心特征）===
-        # 根据训练数据的异常样本统计，异常RR均值≈0.75
-        # 正常RR均值≈1.0，标准差≈0.06
-        
-        # 策略：使用更精确的阈值，避免误判
-        # 下界：设在正常均值-2.5倍标准差
-        normal_rr_mean = np.mean(X_normal[:, 0])
-        normal_rr_std = np.std(X_normal[:, 0])
-        
-        self.thresholds['rr_pre_min'] = normal_rr_mean - 2.5 * normal_rr_std
-        self.thresholds['rr_pre_max'] = normal_rr_mean + 2.5 * normal_rr_std
-        
-        # 如果有异常样本，学习其分布
-        if X_abnormal is not None and len(X_abnormal) > 10:
-            abnormal_rr_mean = np.mean(X_abnormal[:, 0])
-            abnormal_rr_std = np.std(X_abnormal[:, 0])
-            
-            # 异常的RR通常在0.5-0.9之间
-            # 设置一个更保守的下界：正常-异常之间的中点
-            midpoint = (normal_rr_mean + abnormal_rr_mean) / 2
-            self.thresholds['rr_pre_min'] = min(self.thresholds['rr_pre_min'], midpoint)
-            
-            self.abnormal_patterns['rr_mean'] = abnormal_rr_mean
-            self.abnormal_patterns['rr_std'] = abnormal_rr_std
-            
+
+        # 尺度不敏感派生能量特征的正常分布
+        self.derived_mean = {}
+        self.derived_std = {}
+        self.derived_q05 = {}
+        self.derived_q95 = {}
+
+    @staticmethod
+    def _safe_std(x: np.ndarray) -> float:
+        s = float(np.std(x))
+        return s if s > 1e-6 else 1e-6
+
+    @staticmethod
+    def _derive_energy_feats(X: np.ndarray):
+        """
+        从 wt_low, wt_mid, wt_high 计算尺度不敏感派生特征
+        返回 shape=(n, 4): [low_frac, mid_frac, high_frac, mid_over_low]
+        """
+        e_low = X[:, 2]
+        e_mid = X[:, 3]
+        e_high = X[:, 4]
+        eps = 1e-8
+        total = e_low + e_mid + e_high + eps
+
+        low_frac = e_low / total
+        mid_frac = e_mid / total
+        high_frac = e_high / total
+        mid_over_low = e_mid / (e_low + eps)
+        return np.vstack([low_frac, mid_frac, high_frac, mid_over_low]).T
+
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray):
+        n_idx = np.where(y_train == 'N')[0]
+        x_idx = np.where(y_train == 'X')[0]
+        if len(n_idx) == 0:
+            raise ValueError("训练集中没有正常样本(N)，无法建立正常分布。")
+
+        XN = X_train[n_idx]
+        XA = X_train[x_idx] if len(x_idx) > 0 else None
+
+        print(f"[F1优化训练] 正常:{len(XN)}, 异常:{len(x_idx)}")
+
+        # 正常统计（用于 skew/kurt/entropy 等相对稳定的统计量）
+        self._mean = np.mean(XN, axis=0)
+        self._std = np.std(XN, axis=0)
+        self._std = np.where(self._std < 1e-6, 1e-6, self._std)
+
+        # 正常 5%~95% 分位（用于“正常判断/兜底”）
+        self._q_low = np.quantile(XN, 0.05, axis=0)
+        self._q_high = np.quantile(XN, 0.95, axis=0)
+
+        # RR阈值（保留你之前的思路）
+        rr_mean = float(self._mean[0])
+        rr_std = float(self._std[0])
+        rr_min = rr_mean - 2.5 * rr_std
+        rr_max = rr_mean + 2.5 * rr_std
+
+        # 用正常分位夹紧
+        rr_min = min(rr_min, float(self._q_low[0]))
+        rr_max = max(rr_max, float(self._q_high[0]))
+
+        if XA is not None and len(XA) > 10:
+            abnormal_rr_mean = float(np.mean(XA[:, 0]))
+            abnormal_rr_std = self._safe_std(XA[:, 0])
+            midpoint = (rr_mean + abnormal_rr_mean) / 2.0
+            rr_min = min(rr_min, midpoint)
             print(f"[异常模式] RR均值={abnormal_rr_mean:.3f}±{abnormal_rr_std:.3f}")
-        
-        print(f"[F1阈值] RR下界={self.thresholds['rr_pre_min']:.3f}, 上界={self.thresholds['rr_pre_max']:.3f}")
-        
-        # === 2. 记录所有特征的统计量 ===
-        feature_names = ['rr_pre', 'rr_post', 'wt_low', 'wt_mid', 'wt_high', 
-                        'peak_peak', 'skew', 'kurt', 'entropy']
-        
-        for idx, name in enumerate(feature_names):
-            mean_n = np.mean(X_normal[:, idx])
-            std_n = np.std(X_normal[:, idx])
-            
-            self.stat_params[f'{name}_mean'] = mean_n
-            self.stat_params[f'{name}_std'] = std_n
-            
-            # 记录异常样本的统计量
-            if X_abnormal is not None and len(X_abnormal) > 0:
-                mean_x = np.mean(X_abnormal[:, idx])
-                std_x = np.std(X_abnormal[:, idx])
-                self.abnormal_patterns[f'{name}_mean'] = mean_x
-                self.abnormal_patterns[f'{name}_std'] = std_x
-    
-    def predict(self, X_test):
+
+        self.thresholds['rr_pre_min'] = float(rr_min)
+        self.thresholds['rr_pre_max'] = float(rr_max)
+        print(f"[F1阈值] RR下界={rr_min:.3f}, 上界={rr_max:.3f}")
+
+        # 派生能量特征的正常分布（解决跨记录幅值漂移）
+        D = self._derive_energy_feats(XN)
+        d_mean = np.mean(D, axis=0)
+        d_std = np.std(D, axis=0)
+        d_std = np.where(d_std < 1e-6, 1e-6, d_std)
+        d_q05 = np.quantile(D, 0.05, axis=0)
+        d_q95 = np.quantile(D, 0.95, axis=0)
+
+        names = ['low_frac', 'mid_frac', 'high_frac', 'mid_over_low']
+        for k in range(4):
+            self.derived_mean[names[k]] = float(d_mean[k])
+            self.derived_std[names[k]] = float(d_std[k])
+            self.derived_q05[names[k]] = float(d_q05[k])
+            self.derived_q95[names[k]] = float(d_q95[k])
+
+    def _outside_count(self, rr_pre, rr_post, low_frac, mid_frac, entropy, kurt):
         """
-        F1优化的判决策略：
-        - 使用多重证据组合
-        - 提高判决阈值，减少误报
-        - 保证真正的异常能被识别
+        只用相对稳定/尺度不敏感特征做 outside 统计：
+        RR、能量占比、熵、峭度（不使用绝对能量/peak_peak）
         """
-        predictions = []
-        
-        for row in X_test:
-            # 初始化证据得分
-            evidence_score = 0
-            confidence = 0.0
-            
-            # === 证据1: RR间期异常（权重最高）===
-            rr_pre = row[0]
-            rr_post = row[1]
-            
-            # 强异常：RR显著低于阈值
-            if rr_pre < self.thresholds['rr_pre_min']:
-                deviation = (self.thresholds['rr_pre_min'] - rr_pre) / self.stat_params['rr_pre_std']
-                if deviation > 2:  # 偏离超过2个标准差
-                    evidence_score += 4  # 强证据
-                    confidence += 0.8
-                else:
-                    evidence_score += 2  # 中等证据
-                    confidence += 0.5
-            
-            # 异常：RR显著高于阈值（代偿间期）
-            elif rr_pre > self.thresholds['rr_pre_max']:
-                evidence_score += 2
-                confidence += 0.4
-            
-            # 后续RR异常
-            if rr_post < self.thresholds['rr_pre_min'] * 0.95:
-                evidence_score += 1
-                confidence += 0.3
-            
-            # === 证据2: 小波能量异常（中等权重）===
-            # 异常心拍通常低频能量显著增加
-            wt_low = row[2]
-            wt_mid = row[3]
-            
-            z_low = abs(wt_low - self.stat_params['wt_low_mean']) / (self.stat_params['wt_low_std'] + 1e-6)
-            z_mid = abs(wt_mid - self.stat_params['wt_mid_mean']) / (self.stat_params['wt_mid_std'] + 1e-6)
-            
-            if z_low > 3:  # 低频能量异常
-                evidence_score += 2
-                confidence += 0.4
-            elif z_low > 2:
-                evidence_score += 1
-                confidence += 0.2
-            
-            if z_mid > 3:  # 中频能量异常
-                evidence_score += 1
-                confidence += 0.3
-            
-            # === 证据3: 熵异常（信号复杂度）===
-            entropy = row[8]
-            z_ent = (entropy - self.stat_params['entropy_mean']) / (self.stat_params['entropy_std'] + 1e-6)
-            
-            if z_ent > 2:  # 熵显著增加
-                evidence_score += 1
-                confidence += 0.3
-            
-            # === 证据4: 峭度异常（波形形状）===
-            kurt = row[7]
-            z_kurt = abs(kurt - self.stat_params['kurt_mean']) / (self.stat_params['kurt_std'] + 1e-6)
-            
-            if z_kurt > 3:
-                evidence_score += 1
-                confidence += 0.2
-            
-            # === 综合判决（F1优化策略）===
-            # 策略1: 强证据直接判定（Recall保证）
-            if evidence_score >= 4:
-                predictions.append('X')
-            
-            # 策略2: 中等证据+高置信度（平衡）
-            elif evidence_score >= 3 and confidence >= 0.8:
-                predictions.append('X')
-            
-            # 策略3: 弱证据但RR严重异常（关键特征）
-            elif evidence_score >= 2 and rr_pre < self.thresholds['rr_pre_min'] * 0.9:
-                predictions.append('X')
-            
-            # 否则判为正常
+        cnt = 0
+        rr_min = self.thresholds['rr_pre_min']
+        rr_max = self.thresholds['rr_pre_max']
+
+        # RR
+        if rr_pre < rr_min or rr_pre > rr_max:
+            cnt += 1
+        if rr_post < rr_min * 0.95 or rr_post > rr_max * 1.05:
+            cnt += 1
+
+        # 能量占比
+        if low_frac < self.derived_q05['low_frac'] or low_frac > self.derived_q95['low_frac']:
+            cnt += 1
+        if mid_frac < self.derived_q05['mid_frac'] or mid_frac > self.derived_q95['mid_frac']:
+            cnt += 1
+
+        # 熵、峭度（正常分位）
+        if entropy < float(self._q_low[8]) or entropy > float(self._q_high[8]):
+            cnt += 1
+        if kurt < float(self._q_low[7]) or kurt > float(self._q_high[7]):
+            cnt += 1
+
+        return cnt
+
+    def _predict_raw(self, X_test: np.ndarray):
+        n = len(X_test)
+        preds = np.empty(n, dtype='<U1')
+        scores = np.zeros(n, dtype=np.int32)
+        outside = np.zeros(n, dtype=np.int32)
+
+        rr_min = self.thresholds['rr_pre_min']
+        rr_max = self.thresholds['rr_pre_max']
+
+        D = self._derive_energy_feats(X_test)
+        low_frac = D[:, 0]
+        mid_frac = D[:, 1]
+        high_frac = D[:, 2]
+        mid_over_low = D[:, 3]
+
+        def dz(val, name):
+            return (val - self.derived_mean[name]) / (self.derived_std[name] + 1e-6)
+
+        rr_pre_arr = X_test[:, 0]
+        rr_post_arr = X_test[:, 1]
+
+        for i in range(n):
+            row = X_test[i]
+            rr_pre = float(row[0])
+            rr_post = float(row[1])
+
+            z_skew = (float(row[6]) - float(self._mean[6])) / (float(self._std[6]) + 1e-6)
+            z_kurt = (float(row[7]) - float(self._mean[7])) / (float(self._std[7]) + 1e-6)
+            z_ent = (float(row[8]) - float(self._mean[8])) / (float(self._std[8]) + 1e-6)
+
+            z_lf = dz(float(low_frac[i]), 'low_frac')
+            z_mf = dz(float(mid_frac[i]), 'mid_frac')
+            z_hf = dz(float(high_frac[i]), 'high_frac')
+            z_mol = dz(float(mid_over_low[i]), 'mid_over_low')
+
+            outside[i] = self._outside_count(
+                rr_pre, rr_post,
+                float(low_frac[i]), float(mid_frac[i]),
+                float(row[8]), float(row[7])
+            )
+
+            score = 0
+            rr_strong = False
+
+            # RR（强证据）
+            if rr_pre < rr_min:
+                dev = (rr_min - rr_pre) / (float(self._std[0]) + 1e-6)
+                score += 4 if dev > 2.0 else 2
+                rr_strong = True
+            elif rr_pre > rr_max:
+                score += 2
+                rr_strong = True
+
+            if rr_post < rr_min * 0.95 or rr_post > rr_max * 1.05:
+                score += 1
+
+            # 尺度不敏感能量形态
+            if abs(z_lf) > 3.0: score += 1
+            if abs(z_mf) > 3.0: score += 1
+            if abs(z_mol) > 3.0: score += 1
+            if abs(z_hf) > 3.5: score += 1
+
+            # 形态统计（相对稳定）
+            if abs(z_kurt) > 3.2: score += 1
+            if abs(z_skew) > 3.8: score += 1
+            if abs(z_ent) > 2.8: score += 1
+
+            # peak_peak 降权：只补分
+            if rr_strong or score >= 4:
+                z_pp = (float(row[5]) - float(self._mean[5])) / (float(self._std[5]) + 1e-6)
+                if abs(z_pp) > 3.8:
+                    score += 1
+
+            # outside 兜底
+            if outside[i] >= 4:
+                score += 2
+            elif outside[i] >= 3:
+                score += 1
+
+            scores[i] = score
+
+            # 判决：RR“看起来正常”时稍严格，但不要太死（先用 6）
+            rr_normalish = (rr_min * 0.97 <= rr_pre <= rr_max * 1.03) and (rr_min * 0.97 <= rr_post <= rr_max * 1.03)
+            if rr_normalish:
+                preds[i] = 'X' if score >= 6 else 'N'
             else:
-                predictions.append('N')
-        
-        return np.array(predictions)
+                preds[i] = 'X' if score >= 4 else 'N'
+
+        return preds, scores, outside, rr_pre_arr, rr_post_arr, low_frac, mid_frac
+
+    def predict(self, X_test: np.ndarray):
+        preds, _, _, _, _, _, _ = self._predict_raw(X_test)
+        return preds
 
 
 class BalancedClassifier:
-    """
-    平衡分类器 - 针对不同文件自适应调整
-    结合全局模型和局部统计
-    """
     def __init__(self):
         self.global_model = F1OptimizedClassifier()
-        
+
     def fit(self, X_train, y_train):
-        """训练全局模型"""
         self.global_model.fit(X_train, y_train)
-    
+
     def predict(self, X_test):
-        """预测，可以根据数据特征微调"""
-        # 使用F1优化模型
-        predictions = self.global_model.predict(X_test)
-        
-        # 可选：后处理优化
-        # 例如：平滑化，去除孤立异常等
-        predictions = self._smooth_predictions(predictions, X_test)
-        
-        return predictions
-    
-    def _smooth_predictions(self, predictions, X_test, window=5):
-        """
-        平滑预测结果：
-        - 如果一个X周围都是N，可能是误报
-        - 如果一个N周围都是X，可能是漏检
-        """
-        smoothed = predictions.copy()
-        n = len(predictions)
-        
+        preds, scores, outside, rr_pre, rr_post, low_frac, mid_frac = self.global_model._predict_raw(X_test)
+
+        rr_min = self.global_model.thresholds['rr_pre_min']
+        rr_max = self.global_model.thresholds['rr_pre_max']
+
+        pred_abn_rate = float(np.mean(preds == 'X'))
+        rr_outlier_rate = float(np.mean((rr_pre < rr_min) | (rr_pre > rr_max)))
+
+        # ==========================================================
+        # 模式 1：高异常模式（反向逻辑，专治 H2511143S7N68 这种 91% 异常）
+        # 先估计“非常正常”的拍占比，如果很低 => 直接采用“非正常即异常”
+        # ==========================================================
+        ent = X_test[:, 8]
+        ku = X_test[:, 7]
+
+        is_normal = (
+            (rr_min * 0.97 <= rr_pre) & (rr_pre <= rr_max * 1.03) &
+            (rr_min * 0.97 <= rr_post) & (rr_post <= rr_max * 1.03) &
+            (self.global_model.derived_q05['low_frac'] <= low_frac) & (low_frac <= self.global_model.derived_q95['low_frac']) &
+            (self.global_model.derived_q05['mid_frac'] <= mid_frac) & (mid_frac <= self.global_model.derived_q95['mid_frac']) &
+            (self.global_model._q_low[8] <= ent) & (ent <= self.global_model._q_high[8]) &
+            (self.global_model._q_low[7] <= ku) & (ku <= self.global_model._q_high[7])
+        )
+        normal_rate = float(np.mean(is_normal))
+
+        if normal_rate < 0.35:
+            print(f"[高异常模式] normal_rate={normal_rate:.2%}，启用“非正常即异常”")
+            preds = np.where(is_normal, 'N', 'X')
+            pred_abn_rate = float(np.mean(preds == 'X'))
+            # 高异常模式下不再做“收紧”，只做轻度平滑即可
+
+        # ==========================================================
+        # 模式 2：误报收紧（防止 Fold4 类的整段漂移误报）
+        # 如果预测异常比例很高但 RR 基本正常 => 收紧
+        # ==========================================================
+        if pred_abn_rate > 0.35 and rr_outlier_rate < 0.08:
+            print(f"[自适应-收紧] pred_X={pred_abn_rate:.2%}, rr_outlier={rr_outlier_rate:.2%}，疑似误报偏多，收紧")
+            keep = (scores >= 7) | (rr_pre < rr_min) | (rr_pre > rr_max)
+            preds = np.where(keep, 'X', 'N')
+            pred_abn_rate = float(np.mean(preds == 'X'))
+
+        # ==========================================================
+        # 模式 3：低异常放宽（专治 1%~6% 异常文件的漏检）
+        # ==========================================================
+        if pred_abn_rate < 0.03:
+            print(f"[低异常放宽] pred_X={pred_abn_rate:.2%}，放宽：score>=5 判X")
+            preds = np.where((scores >= 5) | (rr_pre < rr_min) | (rr_pre > rr_max), 'X', preds)
+
+        # 平滑：去掉孤立低分X，补充孤立N
+        preds = self._smooth_predictions(preds, scores, rr_pre, rr_post, rr_min, rr_max, window=5)
+        return preds
+
+    def _smooth_predictions(self, preds, scores, rr_pre, rr_post, rr_min, rr_max, window=5):
+        sm = preds.copy()
+        n = len(preds)
+
         for i in range(n):
-            # 获取窗口
-            start = max(0, i - window // 2)
-            end = min(n, i + window // 2 + 1)
-            window_preds = predictions[start:end]
-            
-            # 统计窗口内的X比例
-            x_ratio = sum(window_preds == 'X') / len(window_preds)
-            
-            # 如果是孤立的X，可能是误报（提高Precision）
-            if predictions[i] == 'X' and x_ratio < 0.2:
-                # 检查RR特征，如果不是强异常就改为N
-                if X_test[i, 0] > 0.85:  # RR不是很低
-                    smoothed[i] = 'N'
-            
-            # 如果是孤立的N在X群中，可能是漏检（提高Recall）
-            elif predictions[i] == 'N' and x_ratio > 0.8:
-                smoothed[i] = 'X'
-        
-        return smoothed
+            s = max(0, i - window // 2)
+            e = min(n, i + window // 2 + 1)
+            x_ratio = float(np.mean(preds[s:e] == 'X'))
+
+            rr_normalish = (rr_min * 0.97 <= rr_pre[i] <= rr_max * 1.03) and (rr_min * 0.97 <= rr_post[i] <= rr_max * 1.03)
+
+            # 孤立X：窗口内X很少 + RR正常 + 分数不高 => 回填N（压FP）
+            if preds[i] == 'X' and x_ratio < 0.25 and rr_normalish and scores[i] <= 6:
+                sm[i] = 'N'
+
+            # 孤立N：窗口内几乎全X => 回填X（压FN）
+            if preds[i] == 'N' and x_ratio > 0.85:
+                sm[i] = 'X'
+
+        return sm

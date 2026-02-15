@@ -5,8 +5,6 @@ import os
 import numpy as np
 import pickle
 from datetime import datetime
-# from algorithm import RuleBasedClassifier
-# from algorithm_v3 import AggressiveClassifier as RuleBasedClassifier
 from algorithm_f1_optimized import BalancedClassifier as RuleBasedClassifier
 import config
 from features import extract_features_with_cache

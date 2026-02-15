@@ -119,7 +119,9 @@ def predict_single_file(model, filename, save_output=True):
         os.makedirs(output_dir, exist_ok=True)
         
         save_path = os.path.join(output_dir, f"{filename}.mat")
-        sio.savemat(save_path, {'Beat_Types': y_pred})
+        # 转换为 object 类型数组，确保在 MATLAB 中是 Cell Array 格式 (N x 1)
+        y_pred_obj = y_pred.astype(object)
+        sio.savemat(save_path, {'Beat_Types': y_pred_obj})
         
         print(f"[保存] {save_path}")
     
